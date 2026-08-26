@@ -177,8 +177,19 @@ function cleanupPatchedPodspec(patchedPath /*: ?string */) /*: void */ {
  * interpolation — appends a warning so the caller can surface it to the
  * user. Always returns a RawSpec; pure-JS, no Ruby dep required.
  */
+// Comment-only lines are dropped so a commented-out `# s.header_dir` cannot win
+// over the live one. A trailing `#` and a `#` inside a string survive: only the
+// first non-whitespace character counts.
+function readPodspecSource(podspecPath /*: string */) /*: string */ {
+  return fs
+    .readFileSync(podspecPath, 'utf8')
+    .split('\n')
+    .filter(line => !/^\s*#/.test(line))
+    .join('\n');
+}
+
 function regexPodspec(podspecPath /*: string */) /*: RawSpec */ {
-  const content = fs.readFileSync(podspecPath, 'utf8');
+  const content = readPodspecSource(podspecPath);
   const warnings /*: Array<string> */ = [];
 
   // Matches:  s.<field> = "value"   or   s.<field> = 'value'
@@ -687,8 +698,81 @@ function readPodspec(podspecPath /*: string */) /*: PodspecModel */ {
   return model;
 }
 
+const podspecModels /*: Map<string, PodspecModel> */ = new Map();
+
+/**
+ * readPodspec memoized on the resolved path. `pod ipc spec` costs a process
+ * spawn, and one autolinking run reads the same podspec from several sites
+ * (name resolution, header search paths, scaffolding). The model is shared, so
+ * callers must treat it as read-only.
+ */
+function readPodspecCached(podspecPath /*: string */) /*: PodspecModel */ {
+  const key = path.resolve(podspecPath);
+  const cached = podspecModels.get(key);
+  if (cached != null) {
+    return cached;
+  }
+  const model = readPodspec(podspecPath);
+  podspecModels.set(key, model);
+  return model;
+}
+
+/**
+ * The two fields that name a library, read WITHOUT `pod ipc spec`'s process
+ * spawn — name resolution runs for every dep, including self-managed ones that
+ * need nothing else from the podspec.
+ *
+ * Null when the answer cannot be trusted without Ruby: an interpolated value,
+ * or a `header_dir` the regex could not read. `header_dir` outranks the name,
+ * so a literal name alone is not enough — resolving without it would pick the
+ * wrong prefix.
+ */
+function readPodspecNames(
+  podspecPath /*: string */,
+) /*: ?{name: ?string, headerDir: ?string} */ {
+  const raw = regexPodspec(podspecPath);
+  const field = (key /*: string */) /*: ?string */ => {
+    // $FlowFixMe[prop-missing] RawSpec is dynamically shaped
+    const value = raw[key];
+    return typeof value === 'string' &&
+      value.length > 0 &&
+      !value.includes('#{')
+      ? value
+      : null;
+  };
+  const name = field('name');
+  const headerDir = field('header_dir');
+  if (
+    headerDir == null &&
+    /(?:s|spec)\.header_dir\s*=/.test(readPodspecSource(podspecPath))
+  ) {
+    return null;
+  }
+  return name == null && headerDir == null ? null : {name, headerDir};
+}
+
+/**
+ * Every podspec in `dir`, sorted so two of them name a target the same way on
+ * every machine (readdir order is unspecified). Skips a crashed run's leftover
+ * `.spm-scaffold-<pid>-<name>.podspec` copy.
+ */
+function findPodspecs(dir /*: string */) /*: Array<string> */ {
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter(e => e.endsWith('.podspec') && !e.startsWith('.spm-scaffold-'))
+      .sort()
+      .map(e => path.join(dir, e));
+  } catch {
+    return [];
+  }
+}
+
 module.exports = {
+  findPodspecs,
   readPodspec,
+  readPodspecCached,
+  readPodspecNames,
   runPodIpcSpec,
   regexPodspec,
   flattenSubspecs,
